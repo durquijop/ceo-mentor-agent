@@ -2,40 +2,65 @@ import { Request, Response } from 'express';
 import { config } from './config';
 import { getOrCreateSession, getRecentMessages, saveMessage, updateSessionContext } from './supabase';
 import { generateResponse } from './llm';
-import { sendText, markAsRead, sendReaction } from './whatsapp';
+import { sendText, markAsRead } from './whatsapp';
+
+// ── Kapso v2 webhook payload types ──
+// Docs: https://docs.kapso.ai/docs/platform/webhooks/event-types
+
+interface KapsoMessage {
+  id: string;
+  timestamp: string;
+  type: string;
+  text?: { body: string };
+  interactive?: {
+    type: string;
+    button_reply?: { id: string; title: string };
+    list_reply?: { id: string; title: string; description?: string };
+    nfm_reply?: { response_json: string };
+  };
+  image?: { id: string; caption?: string };
+  audio?: { id: string; voice?: boolean };
+  document?: { id: string; filename?: string; caption?: string };
+  location?: { latitude: number; longitude: number; name?: string };
+  from?: string; // present in Meta raw format
+  kapso?: {
+    direction: 'inbound' | 'outbound';
+    status: string;
+    content?: string;
+    has_media?: boolean;
+  };
+}
 
 interface KapsoWebhookBody {
-  message?: {
-    id: string;
-    from: string;
-    timestamp: string;
-    type: string;
-    text?: { body: string };
-    interactive?: {
-      type: string;
-      button_reply?: { id: string; title: string };
-      list_reply?: { id: string; title: string; description?: string };
-    };
-    image?: { id: string; caption?: string };
-    audio?: { id: string; voice?: boolean };
-    document?: { id: string; filename?: string; caption?: string };
-    location?: { latitude: number; longitude: number; name?: string };
-  };
+  message?: KapsoMessage;
   conversation?: {
     id: string;
     phone_number: string;
-    contact_name?: string;
-  };
-  whatsapp_config?: {
-    phone_number_id: string;
-    display_phone_number: string;
+    phone_number_id?: string;
+    status?: string;
+    kapso?: {
+      contact_name?: string;
+      messages_count?: number;
+    };
   };
   is_new_conversation?: boolean;
+  phone_number_id?: string;
+  // Meta raw format
+  entry?: Array<{
+    changes: Array<{
+      value: {
+        messages?: Array<KapsoMessage>;
+        contacts?: Array<{ profile?: { name?: string }; wa_id?: string }>;
+      };
+    }>;
+  }>;
 }
 
-function extractMessageText(message: KapsoWebhookBody['message']): string | null {
-  if (!message) return null;
-
+function extractMessageText(message: KapsoMessage): string | null {
+  // Kapso v2: use kapso.content if available
+  if (message.kapso?.content) {
+    return message.kapso.content;
+  }
   if (message.type === 'text' && message.text?.body) {
     return message.text.body;
   }
@@ -59,7 +84,6 @@ function extractMessageText(message: KapsoWebhookBody['message']): string | null
   if (message.type === 'location') {
     return `[Ubicación: ${message.location?.name || `${message.location?.latitude},${message.location?.longitude}`}]`;
   }
-
   return null;
 }
 
@@ -69,95 +93,104 @@ function isOwner(phone: string): boolean {
 }
 
 // Store last N webhook payloads for debugging
-const debugLog: Array<{ ts: string; body: unknown }> = [];
+const debugLog: Array<{ ts: string; body: unknown; note?: string }> = [];
 
 export function getDebugLog() {
   return debugLog;
 }
 
 export async function handleWebhook(req: Request, res: Response): Promise<void> {
-  // Respond immediately to avoid Kapso timeout
   res.sendStatus(200);
 
   try {
-    const body = req.body;
-    console.log(`[webhook] RAW BODY: ${JSON.stringify(body).slice(0, 500)}`);
+    const body: KapsoWebhookBody = req.body;
+    const bodyStr = JSON.stringify(body).slice(0, 500);
+    console.log(`[webhook] BODY: ${bodyStr}`);
 
-    // Store for debug endpoint
     debugLog.push({ ts: new Date().toISOString(), body });
     if (debugLog.length > 20) debugLog.shift();
 
-    // Kapso v1 webhook format: the message might be nested differently
-    // Try multiple possible structures
-    let message = body.message;
+    let message: KapsoMessage | undefined;
     let from: string | undefined;
+    let contactName: string | undefined;
 
-    // Kapso v1 format: { message: { from, type, text, ... } }
-    if (message?.from) {
-      from = message.from;
+    // ── Format 1: Kapso v2 webhook (default) ──
+    // { message: { id, type, text, kapso: { direction, content } }, conversation: { phone_number } }
+    if (body.message && body.conversation?.phone_number) {
+      message = body.message;
+      from = body.conversation.phone_number.replace(/\D/g, '');
+      contactName = body.conversation.kapso?.contact_name;
+
+      // Skip outbound messages (our own replies echoed back)
+      if (message.kapso?.direction === 'outbound') {
+        console.log(`[webhook] Skipping outbound message`);
+        return;
+      }
     }
-    // Meta/Kapso raw format: { entry: [{ changes: [{ value: { messages: [...] } }] }] }
+    // ── Format 2: Kapso v2 with from in message ──
+    else if (body.message?.from) {
+      message = body.message;
+      from = body.message.from.replace(/\D/g, '');
+      contactName = body.conversation?.kapso?.contact_name;
+    }
+    // ── Format 3: Meta raw webhook format ──
     else if (body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
-      const metaMsg = body.entry[0].changes[0].value.messages[0];
-      message = metaMsg;
-      from = metaMsg.from;
-      console.log(`[webhook] Detected Meta raw webhook format`);
+      const value = body.entry[0].changes[0].value;
+      message = value.messages![0];
+      from = message.from?.replace(/\D/g, '');
+      contactName = value.contacts?.[0]?.profile?.name;
+      console.log(`[webhook] Detected Meta raw format`);
     }
 
     if (!message) {
-      console.log(`[webhook] No message found in body. Keys: ${Object.keys(body).join(', ')}`);
+      console.log(`[webhook] No message. Keys: ${Object.keys(body).join(', ')}`);
+      debugLog[debugLog.length - 1].note = 'no_message';
       return;
     }
 
     if (!from) {
-      console.log(`[webhook] No 'from' in message. Keys: ${Object.keys(message).join(', ')}`);
+      console.log(`[webhook] No phone number found`);
+      debugLog[debugLog.length - 1].note = 'no_from';
       return;
     }
 
-    // Only respond to owner's numbers
     if (!isOwner(from)) {
-      console.log(`[webhook] Ignored message from non-owner: ${from}`);
+      console.log(`[webhook] Non-owner: ${from}`);
+      debugLog[debugLog.length - 1].note = `non_owner:${from}`;
       return;
     }
 
     const text = extractMessageText(message);
-    if (!text) return;
-
-    console.log(`[webhook] Message from ${from}: ${text.slice(0, 100)}`);
-
-    // Mark as read + show typing
-    try {
-      await markAsRead(message.id);
-    } catch (e) {
-      // Non-critical
+    if (!text) {
+      console.log(`[webhook] No text extractable from type=${message.type}`);
+      debugLog[debugLog.length - 1].note = `no_text:${message.type}`;
+      return;
     }
 
-    // Get/create session and recent messages
-    const contactName = body.conversation?.contact_name;
+    console.log(`[webhook] Processing: ${from} → "${text.slice(0, 80)}"`);
+    debugLog[debugLog.length - 1].note = `processing:${from}`;
+
+    // Mark as read + typing
+    try { await markAsRead(message.id); } catch (_) {}
+
     const session = await getOrCreateSession(from, contactName);
     const history = await getRecentMessages(from);
 
-    // Save user message
     await saveMessage(from, 'user', text);
 
-    // Decide whether to include business data
     const includeData = shouldIncludeBusinessData(text);
-
-    // Generate response
     const response = await generateResponse(history, text, includeData);
 
-    // Save assistant message
     await saveMessage(from, 'assistant', response);
-
-    // Update conversation timestamp
     await updateSessionContext(from, {});
-
-    // Send response via WhatsApp
     await sendText(from, response);
 
-    console.log(`[webhook] Response sent to ${from} (${response.length} chars)`);
+    console.log(`[webhook] Sent to ${from} (${response.length} chars)`);
+    debugLog[debugLog.length - 1].note = `sent:${response.length}`;
   } catch (error) {
-    console.error('[webhook] Error processing message:', error);
+    console.error('[webhook] ERROR:', error);
+    debugLog.push({ ts: new Date().toISOString(), body: { error: String(error) }, note: 'error' });
+    if (debugLog.length > 20) debugLog.shift();
   }
 }
 
