@@ -99,7 +99,8 @@ export async function handleWebhook(req: Request, res: Response): Promise<void> 
     }
 
     // Get/create session and recent messages
-    const session = await getOrCreateSession(from);
+    const contactName = body.conversation?.contact_name;
+    const session = await getOrCreateSession(from, contactName);
     const history = await getRecentMessages(from);
 
     // Save user message
@@ -114,12 +115,8 @@ export async function handleWebhook(req: Request, res: Response): Promise<void> 
     // Save assistant message
     await saveMessage(from, 'assistant', response);
 
-    // Update session context with last interaction
-    await updateSessionContext(from, {
-      ...session.context,
-      last_message_at: new Date().toISOString(),
-      message_count: ((session.context as any)?.message_count || 0) + 1,
-    });
+    // Update conversation timestamp
+    await updateSessionContext(from, {});
 
     // Send response via WhatsApp
     await sendText(from, response);
