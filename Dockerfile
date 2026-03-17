@@ -4,6 +4,7 @@ COPY package*.json ./
 RUN npm ci
 COPY tsconfig.json ./
 COPY src/ ./src/
+ARG CACHE_BUST=v7
 RUN npm run build
 
 FROM node:20-alpine
