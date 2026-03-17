@@ -1,15 +1,15 @@
-FROM node:20-alpine AS builder
+FROM node:20-slim AS builder
+LABEL rebuild="v10-anthropic"
 WORKDIR /app
-COPY package*.json ./
+COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json ./
-ARG CACHE_BUST=v8
 COPY src/ ./src/
-RUN npm run build
+RUN npm run build && ls -la dist/llm.js && head -5 dist/llm.js
 
-FROM node:20-alpine
+FROM node:20-slim
 WORKDIR /app
-COPY package*.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 EXPOSE 3000
