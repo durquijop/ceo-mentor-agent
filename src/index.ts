@@ -2,6 +2,7 @@ import express from 'express';
 import { config, validateConfig } from './config';
 import { handleWebhook, getDebugLog } from './webhook';
 import { startProactiveCrons } from './proactive';
+import { startPoller } from './poller';
 
 validateConfig();
 
@@ -33,4 +34,5 @@ app.get('/debug', (_req, res) => {
 app.listen(config.port, () => {
   console.log(`[${config.agentName}] Server running on port ${config.port}`);
   startProactiveCrons();
+  startPoller();
 });
