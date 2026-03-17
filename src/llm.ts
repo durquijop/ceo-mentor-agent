@@ -1,18 +1,5 @@
-import OpenAI from 'openai';
 import { config } from './config';
 import { ConversationMessage, getBusinessSnapshot } from './supabase';
-
-let openai: OpenAI;
-
-function getClient(): OpenAI {
-  if (!openai) {
-    openai = new OpenAI({
-      apiKey: config.llmApiKey,
-      baseURL: config.llmBaseUrl,
-    });
-  }
-  return openai;
-}
 
 const SYSTEM_PROMPT = `Eres Atlas, el mentor CEO personal de Diego Urquijo.
 
@@ -51,13 +38,16 @@ Eres su mentor ejecutivo, estratega y sparring partner. NO eres un asistente gen
 - No te disculpas innecesariamente
 - No repites lo que Diego ya sabe`;
 
+interface AnthropicResponse {
+  content: Array<{ type: string; text: string }>;
+  error?: { type: string; message: string };
+}
+
 export async function generateResponse(
   messages: ConversationMessage[],
   userMessage: string,
   includeBusinessData = false
 ): Promise<string> {
-  const client = getClient();
-
   const systemParts = [SYSTEM_PROMPT];
 
   if (includeBusinessData) {
@@ -67,25 +57,45 @@ export async function generateResponse(
         `\n\n## Datos del negocio (hoy)\n${JSON.stringify(snapshot, null, 2)}`
       );
     } catch (e) {
-      // Business data is optional, don't fail the response
+      // Business data is optional
     }
   }
 
-  const chatMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-    { role: 'system', content: systemParts.join('') },
+  const anthropicMessages = [
     ...messages.slice(-20).map((m) => ({
       role: m.role as 'user' | 'assistant',
       content: m.content,
     })),
-    { role: 'user', content: userMessage },
+    { role: 'user' as const, content: userMessage },
   ];
 
-  const completion = await client.chat.completions.create({
-    model: config.llmModel,
-    messages: chatMessages,
-    max_tokens: 1024,
-    temperature: 0.7,
+  const res = await fetch(`${config.llmBaseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      'x-api-key': config.llmApiKey,
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: config.llmModel,
+      max_tokens: 1024,
+      temperature: 0.7,
+      system: systemParts.join(''),
+      messages: anthropicMessages,
+    }),
   });
 
-  return completion.choices[0]?.message?.content || 'No pude generar una respuesta.';
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Anthropic API ${res.status}: ${errText}`);
+  }
+
+  const data = (await res.json()) as AnthropicResponse;
+
+  if (data.error) {
+    throw new Error(`Anthropic error: ${data.error.message}`);
+  }
+
+  const text = data.content?.find((c) => c.type === 'text')?.text;
+  return text || 'No pude generar una respuesta.';
 }
