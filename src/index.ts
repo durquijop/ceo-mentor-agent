@@ -1,6 +1,6 @@
 import express from 'express';
 import { config, validateConfig } from './config';
-import { handleWebhook } from './webhook';
+import { handleWebhook, getDebugLog } from './webhook';
 import { startProactiveCrons } from './proactive';
 
 validateConfig();
@@ -23,6 +23,11 @@ app.get('/health', (_req, res) => {
 
 // Kapso webhook
 app.post('/webhook', handleWebhook);
+
+// Debug endpoint (temporary)
+app.get('/debug', (_req, res) => {
+  res.json({ logs: getDebugLog() });
+});
 
 // Start server
 app.listen(config.port, () => {

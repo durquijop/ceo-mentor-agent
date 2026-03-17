@@ -68,17 +68,51 @@ function isOwner(phone: string): boolean {
   return config.ownerNumbers.some((n) => clean.endsWith(n));
 }
 
+// Store last N webhook payloads for debugging
+const debugLog: Array<{ ts: string; body: unknown }> = [];
+
+export function getDebugLog() {
+  return debugLog;
+}
+
 export async function handleWebhook(req: Request, res: Response): Promise<void> {
   // Respond immediately to avoid Kapso timeout
   res.sendStatus(200);
 
   try {
-    const body: KapsoWebhookBody = req.body;
-    const message = body.message;
-    if (!message) return;
+    const body = req.body;
+    console.log(`[webhook] RAW BODY: ${JSON.stringify(body).slice(0, 500)}`);
 
-    const from = message.from;
-    if (!from) return;
+    // Store for debug endpoint
+    debugLog.push({ ts: new Date().toISOString(), body });
+    if (debugLog.length > 20) debugLog.shift();
+
+    // Kapso v1 webhook format: the message might be nested differently
+    // Try multiple possible structures
+    let message = body.message;
+    let from: string | undefined;
+
+    // Kapso v1 format: { message: { from, type, text, ... } }
+    if (message?.from) {
+      from = message.from;
+    }
+    // Meta/Kapso raw format: { entry: [{ changes: [{ value: { messages: [...] } }] }] }
+    else if (body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
+      const metaMsg = body.entry[0].changes[0].value.messages[0];
+      message = metaMsg;
+      from = metaMsg.from;
+      console.log(`[webhook] Detected Meta raw webhook format`);
+    }
+
+    if (!message) {
+      console.log(`[webhook] No message found in body. Keys: ${Object.keys(body).join(', ')}`);
+      return;
+    }
+
+    if (!from) {
+      console.log(`[webhook] No 'from' in message. Keys: ${Object.keys(message).join(', ')}`);
+      return;
+    }
 
     // Only respond to owner's numbers
     if (!isOwner(from)) {
